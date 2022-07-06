@@ -1,70 +1,78 @@
-# services:
-#   setup:
-#     image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
-#     volumes:
-#       - ./certs:/usr/share/elasticsearch/config/certs
-#     user: "0"
-#     command: >
-#       bash -c '
-#         echo "Checking password configuration...";
-#         if [ x${ELASTIC_PASSWORD} == x ]; then
-#           echo "Set the ELASTIC_PASSWORD environment variable in the .env file";
-#           exit 1;
-#         elif [ x${KIBANA_PASSWORD} == x ]; then
-#           echo "Set the KIBANA_PASSWORD environment variable in the .env file";
-#           exit 1;
-#         fi;
-#         echo "Password configuration OK";
-
-#         echo "Checking CA...";
-#         if [[ ! -f  config/certs/ca/ca.crt ]] || [[ ! -f config/certs/ca/ca.key ]]; then
-#           echo "CA not found. Creating CA";
-#           bin/elasticsearch-certutil ca --silent --pem -out config/certs/ca.zip;
-#           unzip -o config/certs/ca.zip -d config/certs;
-#         fi;
-#         echo "CA OK"
-
-#         echo "Checking certs..."
-#         if [[ ! -f config/certs/certs.zip ]]; then
-#           echo "Creating certs";
-#           echo -ne \
-#           "instances:\n"\
-#           "  - name: es01\n"\
-#           "    dns:\n"\
-#           "      - es01\n"\
-#           "      - localhost\n"\
-#           "    ip:\n"\
-#           "      - 127.0.0.1\n"\
-#           > config/certs/instances.yml;
-#           bin/elasticsearch-certutil cert --silent --pem -out config/certs/certs.zip --in config/certs/instances.yml --ca-cert config/certs/ca/ca.crt --ca-key config/certs/ca/ca.key;
-#           unzip -o config/certs/certs.zip -d config/certs;
-#         fi;
-#         echo "Certs OK"
-
-#         echo "Setting file permissions"
-#         chown -R root:root config/certs;
-#         find . -type d -exec chmod 750 \{\} \;;
-#         find . -type f -exec chmod 640 \{\} \;;
-
-#         echo "Attempting to copy certificate to nodes"
-#         echo "Waiting for Elasticsearch availability";
-#         ls config/certs/ca
-#         until curl -s --cacert config/certs/ca/ca.crt https://es01:9200 | grep -q "missing authentication credentials"; do sleep 10; done;
-
-#         echo "Setting kibana_system password";
-#         until curl -s -X POST --cacert config/certs/ca/ca.crt -u elastic:${ELASTIC_PASSWORD} -H "Content-Type: application/json" https://es01:9200/_security/user/kibana_system/_password -d "{\"password\":\"${KIBANA_PASSWORD}\"}" | grep -q "^{}"; do sleep 10; done;
-#         echo "All done!";
-#       '
-#     healthcheck:
-#       test: [ "CMD-SHELL", "[ -f config/certs/es01/es01.crt ]" ]
-#       interval: 1s
-#       timeout: 5s
-#       retries: 120
-
-# Elasticsearch
-
 version: '3'
+
+# Create the certificates and attempt to copy them to the nodes
+
 services:
+  create_certs:
+    container_name: create_certs
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    command: >
+      bash -c '
+        echo "Checking CA...";
+        if [[ ! -f  /certs/ca.zip ]]; then
+          echo "CA not found. Creating CA";
+          bin/elasticsearch-certutil ca --silent --pem -out /certs/ca.zip;
+          unzip -o /certs/ca.zip -d /certs;
+        else
+          echo "CA already present";
+        fi;
+        echo "CA OK"
+
+        echo "Checking ES certificates...";
+        if [[ ! -f /certs/certs.zip ]]; then
+          bin/elasticsearch-certutil cert --silent --pem\
+          --ca-cert /certs/ca/ca.crt --ca-key /certs/ca/ca.key\
+          --in ${CFG_DIR}/instances.yml --out /certs/certs.zip;
+          unzip /certs/certs.zip -d /certs;
+        fi; 
+        if [[ ! -f /es01_certs/es01.key ]] || [[ ! -f /es01_certs/es01.crt ]] || [[ ! -f /es01_certs/ca.crt ]]; then
+          echo "Copying certificates and key to es01..."
+          cp /certs/es01/* /es01_certs;
+          cp /certs/ca/ca.crt /es01_certs;
+        fi;
+        if [[ ! -f /kb01_certs/kb01.key ]] || [[ ! -f /kb01_certs/kb01.crt ]] || [[ ! -f /kb01_certs/ca.crt ]]; then
+          echo "Copying certificates and key to kb01..."
+          cp /certs/kb01/* /kb01_certs;
+          cp /certs/ca/ca.crt /kb01_certs;
+        fi;
+        chown -R 1000:0 /certs 
+        chown -R 1000:0 /es01_certs 
+        chown -R 1000:0 /kb01_certs
+        echo "Certificates OK"
+
+        until 
+          curl -s --cacert /certs/ca/ca.crt https://es01:9200 | grep -q "missing authentication credentials";
+        do 
+          sleep 10;
+          echo "Waiting for Elasticsearch availability...";
+        done;
+        echo "Elasticsearch instance up and running"
+
+        echo "Setting kibana_system password";
+        until 
+          curl -s -X POST --cacert /certs/ca/ca.crt -u elastic:${ELASTIC_PASSWORD}\
+          -H "Content-Type: application/json" https://es01:9200/_security/user/kibana_system/_password \
+          -d "{\"password\":\"${KIBANA_PASSWORD}\"}" | grep -q "^{}"; 
+        do 
+          sleep 10;
+          echo "Waiting for Kibana availability...";
+        done;
+        echo "Kibana password configured"
+
+        echo "All done!";
+      '
+    user: "0"
+    working_dir: /usr/share/elasticsearch
+    volumes:
+      [
+        'certs:/certs',
+        'es01_certs:/es01_certs',
+        'kb01_certs:/kb01_certs',
+        '${SERVER_DIR}/instances.yml:${CFG_DIR}/instances.yml'
+      ]
+
+  # Elasticsearch
+
   es01:
     image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
     environment:
@@ -77,22 +85,22 @@ services:
       - xpack.license.self_generated.type=trial
       - xpack.security.enabled=true
       - xpack.security.http.ssl.enabled=true
-      - xpack.security.http.ssl.key=$CERTS_DIR/es01/es01.key
-      - xpack.security.http.ssl.certificate_authorities=$CERTS_DIR/ca/ca.crt
-      - xpack.security.http.ssl.certificate=$CERTS_DIR/es01/es01.crt
+      - xpack.security.http.ssl.key=${CERTS_DIR}/es01.key
+      - xpack.security.http.ssl.certificate_authorities=${CERTS_DIR}/ca.crt
+      - xpack.security.http.ssl.certificate=${CERTS_DIR}/es01.crt
       - xpack.security.transport.ssl.enabled=true
       - xpack.security.transport.ssl.verification_mode=certificate
-      - xpack.security.transport.ssl.certificate_authorities=$CERTS_DIR/ca/ca.crt
-      - xpack.security.transport.ssl.certificate=$CERTS_DIR/es01/es01.crt
-      - xpack.security.transport.ssl.key=$CERTS_DIR/es01/es01.key
+      - xpack.security.transport.ssl.certificate_authorities=${CERTS_DIR}/ca.crt
+      - xpack.security.transport.ssl.key=${CERTS_DIR}/es01.key
+      - xpack.security.transport.ssl.certificate=${CERTS_DIR}/es01.crt
     volumes:
       - 'data01:/usr/share/elasticsearch/data'
-      - 'certs:$CERTS_DIR'
+      - 'es01_certs:${CERTS_DIR}'
     ports:
       - ${ES_PORT}:9200
     #mem_limit: ${MEM_LIMIT}
     healthcheck:
-      test: curl --cacert $CERTS_DIR/ca/ca.crt -s https://localhost:9200 >/dev/null; if [[ $$? == 52 ]]; then echo 0; else echo 1; fi
+      test: curl --cacert ${CERTS_DIR}/ca.crt -s https://localhost:9200 >/dev/null; if [[ $$? == 52 ]]; then echo 0; else echo 1; fi
       interval: 30s
       timeout: 10s
       retries: 5
@@ -104,23 +112,24 @@ services:
         condition: service_healthy
     image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
     volumes:
-      - ./certs:/usr/share/kibana/config/certs
-      - ./certs/kibana-certs.p12:/etc/ssl/kibana
-      - /home/keegan/es_container/keycloak_es/config/kibana.yml:/usr/share/elasticsearch/config/kibana.yml
+      - 'kb01_certs:${CERTS_DIR}'
     ports:
       - ${KIBANA_PORT}:5601 #kibana port
     environment:
       - SERVERNAME=kibana
       - ELASTICSEARCH_HOSTS=https://es01:9200
-      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_USERNAME=${KIBANA_USER}
       - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
-      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=config/certs/ca/ca.crt
+      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=${CERTS_DIR}/ca.crt
+      - SERVER_SSL_CERTIFICATE=${CERTS_DIR}/kb01.crt
+      - SERVER_SSL_KEY=${CERTS_DIR}/kb01.key
+      - SERVER_SSL_ENABLED=true
     mem_limit: ${MEM_LIMIT}
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "curl -s -I http://localhost:5601 | grep -q 'HTTP/1.1 302 Found'"
+          "curl -s --cacert ${CERTS_DIR}/ca.crt -I https://localhost:5601 | grep -q 'HTTP/1.1 302 Found'"
         ]
       interval: 10s
       timeout: 10s
@@ -156,8 +165,9 @@ services:
       - postgres
 
 volumes:
-  #{ "data01", "certs" }
   data01:
   certs:
+  es01_certs:
+  kb01_certs:
   postgres_data:
     driver: local
