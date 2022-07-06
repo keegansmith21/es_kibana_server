@@ -166,8 +166,12 @@ services:
 
 volumes:
   data01:
+    driver: local
   certs:
+    driver: local
   es01_certs:
+    driver: local
   kb01_certs:
+    driver: local
   postgres_data:
     driver: local
