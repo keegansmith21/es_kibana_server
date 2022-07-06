@@ -5,3 +5,9 @@ instances:
       - localhost
     ip:
       - 127.0.0.1
+  - name: kb01
+    dns:
+      - kb01
+      - localhost
+    ip:
+      - 127.0.0.1
